@@ -1,5 +1,5 @@
 /*
-    Oilify - Painterly Strokes v19 (optimized)
+    Oilify - Painterly Strokes v24 (optimized)
 
     Optimization goals:
       - Keep the supplied original Oilify/Kuwahara math intact.
@@ -122,6 +122,39 @@ namespace Oilify
                      "detailed image.";
         ui_min = 1; ui_max = 4;
     > = 1;
+
+    // ---------------------------------------------------------------------
+    // Pre-Oilify image treatment
+    // These controls are deliberately outside the Advanced Settings preset
+    // system. They are applied before the complete original Oilify pipeline.
+    // ---------------------------------------------------------------------
+
+    uniform float PosterizationColors<
+        ui_category = "Simple Settings";
+        ui_type = "slider";
+        ui_label = "Posterization - Colors";
+        ui_tooltip = "Reduces the input image to a selectable number of color levels per channel before Oilify. Higher values retain more colors.";
+        ui_min = 2; ui_max = 256;
+        ui_step = 1;
+    > = 32;
+
+    uniform float CanvasSize<
+        ui_category = "Simple Settings";
+        ui_type = "slider";
+        ui_label = "Canvas - Size";
+        ui_tooltip = "Controls the physical scale of the procedural canvas weave and broad fold pattern in screen pixels. This effect uses no external texture file.";
+        ui_min = 2; ui_max = 96;
+        ui_step = 1;
+    > = 24;
+
+    uniform float CanvasFoldVisibility<
+        ui_category = "Simple Settings";
+        ui_type = "slider";
+        ui_label = "Canvas - Fold Visibility";
+        ui_tooltip = "Controls how visible the procedural canvas weave and broad fold relief are. Zero disables the canvas modulation.";
+        ui_min = 0; ui_max = 1;
+        ui_step = 0.001;
+    > = 0.42;
 
     // ---------------------------------------------------------------------
     // Advanced painterly controls
@@ -418,6 +451,169 @@ namespace Oilify
     }
 
     // ---------------------------------------------------------------------
+    // PRE-OILIFY POSTERIZATION + PROCEDURAL CANVAS
+    // ---------------------------------------------------------------------
+
+    float3 ApplyPosterization(float3 color)
+    {
+        // Use a rounded level count so the UI remains a normal one-step slider.
+        // The calculation intentionally avoids saturating HDR values above 1.0.
+        float levels = max(floor(PosterizationColors + 0.5), 2.0);
+        float scale = levels - 1.0;
+        color = max(color, 0.0);
+        return floor(color * scale + 0.5) / scale;
+    }
+
+    // Continuous hash used by the analytical canvas noise. This is intentionally
+    // independent from the brush-stroke hash above so the canvas keeps its own
+    // stable material pattern and does not inherit the stroke layout.
+    float CanvasHash21(float2 p)
+    {
+        p = frac(p * float2(0.1031, 0.1030));
+        p += dot(p, p.yx + 33.33);
+        return frac((p.x + p.y) * p.x * p.y);
+    }
+
+    float CanvasValueNoise(float2 p)
+    {
+        float2 i = floor(p);
+        float2 f = frac(p);
+        f = f * f * (3.0 - 2.0 * f);
+
+        float a = CanvasHash21(i);
+        float b = CanvasHash21(i + float2(1.0, 0.0));
+        float c = CanvasHash21(i + float2(0.0, 1.0));
+        float d = CanvasHash21(i + float2(1.0, 1.0));
+
+        return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+    }
+
+    // Two-octave FBM is sufficient for the canvas material and cuts the
+    // procedural-noise cost substantially compared with the previous three-
+    // octave implementation. The weights sum to 1, so no final saturate is
+    // required here.
+    float CanvasFBM2(float2 p)
+    {
+        float n = CanvasValueNoise(p) * 0.67;
+        p = p * 2.03 + float2(17.4, -9.2);
+        n += CanvasValueNoise(p) * 0.33;
+        return n;
+    }
+
+    float3 ApplyProceduralCanvas(float3 color, float2 texcoord)
+    {
+        float visibility = saturate(CanvasFoldVisibility);
+        if (visibility <= 0.0001)
+            return color;
+
+        // Everything is generated analytically. No texture asset is required.
+        // CanvasSize controls the nominal thread spacing in screen pixels.
+        float sizePx = max(CanvasSize, 2.0);
+        float2 pixel = texcoord * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+        float2 q = pixel / sizePx;
+
+        // -----------------------------------------------------------------
+        // Irregular domain warp
+        // -----------------------------------------------------------------
+        // Keep the large warp two-octave: it supplies the broad non-periodic
+        // deformation that prevents the fibers from becoming a visible grid.
+        float2 warpSpace = q * 0.24;
+        float warpA = CanvasFBM2(warpSpace + float2(3.7, 11.2)) - 0.5;
+        float warpB = CanvasFBM2(warpSpace * 1.37 + float2(-8.1, 5.4)) - 0.5;
+        float2 warpedQ = q + float2(warpA, warpB) * 0.42;
+
+        // -----------------------------------------------------------------
+        // Long irregular canvas fibers
+        // -----------------------------------------------------------------
+        // These auxiliary bends only need one octave. Their purpose is to
+        // perturb the fiber axes, not to add visible noise by themselves.
+        float fiberWarpX = CanvasValueNoise(warpedQ * float2(0.55, 1.55) + float2(12.3, -4.6)) - 0.5;
+        float fiberWarpY = CanvasValueNoise(warpedQ * float2(1.55, 0.55) + float2(-6.8, 14.7)) - 0.5;
+
+        float2 fiberXCoord = warpedQ * float2(0.72, 5.35);
+        fiberXCoord.y += fiberWarpY * 0.82;
+        fiberXCoord.x += CanvasValueNoise(warpedQ * 0.90 + float2(23.1, 4.2)) * 0.65;
+
+        float2 fiberYCoord = warpedQ * float2(5.35, 0.72);
+        fiberYCoord.x += fiberWarpX * 0.82;
+        fiberYCoord.y += CanvasValueNoise(warpedQ * 0.86 + float2(-17.5, 8.9)) * 0.65;
+
+        // The main fiber fields keep two octaves because this is where the
+        // material's recognizable yarn structure is formed.
+        float fiberXNoise = CanvasFBM2(fiberXCoord);
+        float fiberYNoise = CanvasFBM2(fiberYCoord);
+
+        float fiberX = smoothstep(0.30, 0.74, fiberXNoise);
+        float fiberY = smoothstep(0.30, 0.74, fiberYNoise);
+        float fiberXRidge = fiberX * fiberX * (0.72 + 0.28 * fiberX);
+        float fiberYRidge = fiberY * fiberY * (0.72 + 0.28 * fiberY);
+        float fiberXValley = fiberX * (2.0 - fiberX);
+        float fiberYValley = fiberY * (2.0 - fiberY);
+        fiberXValley = 1.0 - fiberXValley;
+        fiberYValley = 1.0 - fiberYValley;
+
+        // Directional thread relief. Positive values are raised yarn catches;
+        // negative values are the darker troughs between neighboring threads.
+        float warpRelief = fiberXRidge * 0.92 - fiberXValley * 0.56;
+        float weftRelief = fiberYRidge * 0.92 - fiberYValley * 0.56;
+        float fiberRelief = warpRelief * 0.48 + weftRelief * 0.48;
+
+        // -----------------------------------------------------------------
+        // Frayed micro-structure and large soft cloth irregularities
+        // -----------------------------------------------------------------
+        // Keep one detailed two-octave field and two cheap single-octave fields.
+        // Together they retain the broken/fuzzy character at a fraction of the
+        // previous FBM cost.
+        float grainA = CanvasFBM2(warpedQ * 3.35 + float2(41.2, -12.8)) - 0.5;
+        float grainB = CanvasValueNoise(warpedQ * float2(8.8, 2.65) + float2(-28.4, 19.6)) - 0.5;
+        float grainC = CanvasValueNoise(warpedQ * float2(2.2, 8.6) + float2(17.7, -34.5)) - 0.5;
+        float fineFiber = grainA * 0.38 + grainB * 0.22 + grainC * 0.16;
+
+        // Convert the finer noise into broken little ridges instead of smooth
+        // cloudy noise. This reads more like short stray fibers and rough yarn.
+        float roughFiber = smoothstep(0.20, 0.78, fineFiber + 0.5) - 0.42;
+        float roughValley = smoothstep(0.18, 0.66, 0.5 - fineFiber) - 0.40;
+        float frayRelief = roughFiber * 0.16 - roughValley * 0.10;
+
+        // Broad cloth bunching does not need three noise octaves. One two-
+        // octave field plus one single-octave directional field is enough.
+        float clothBunch = CanvasFBM2(warpedQ * 0.17 + float2(-2.4, 37.1)) - 0.5;
+        float clothTilt = CanvasValueNoise(warpedQ * float2(0.31, 0.13) + float2(8.8, -26.4)) - 0.5;
+
+        // Broad fold field plus cross-fiber interaction. The latter makes the
+        // intersections of warp/weft slightly darker or brighter without
+        // reconstructing a square checkerboard.
+        float crossing = fiberXRidge * fiberYRidge * 0.14
+                       - fiberXValley * fiberYValley * 0.08;
+        float bunchRelief = clothBunch * 0.072 + clothTilt * 0.034;
+
+        // Strong material relief. Asymmetric highlight/shadow amplitudes make
+        // the surface read as three-dimensional canvas rather than a flat decal.
+        float weaveRelief = fiberRelief * 0.072;
+        weaveRelief += crossing;
+        weaveRelief += frayRelief * 0.030;
+        weaveRelief += bunchRelief;
+
+        float trough = (fiberXValley + fiberYValley - 0.65) * 0.026;
+        weaveRelief -= trough;
+
+        float relief = weaveRelief * visibility;
+        float3 canvasColor = color * (1.0 + relief);
+        return max(canvasColor, 0.0);
+    }
+
+    void PreOilifyPS(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float4 outputColor : SV_TARGET0)
+    {
+        float3 color = tex2D(sBackBuffer, texcoord).rgb;
+
+        // Required order: posterization first, canvas treatment second.
+        color = ApplyPosterization(color);
+        color = ApplyProceduralCanvas(color, texcoord);
+
+        outputColor = float4(color, 1.0);
+    }
+
+    // ---------------------------------------------------------------------
     // ORIGINAL ANISOTROPY CODE
     // ---------------------------------------------------------------------
 
@@ -467,13 +663,18 @@ namespace Oilify
 
     void KuwaharaPS(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float3 kuwahara : SV_TARGET0)
     {
-        float sharpnessMultiplier = max(1023 * pow(( 2 * Sharpness / 3) + 0.333333, 4), 1e-10);
+        // x^4 is expanded explicitly to avoid a general-purpose pow() call.
+        float sharpnessBase = (2 * Sharpness / 3) + 0.333333;
+        float sharpnessSquared = sharpnessBase * sharpnessBase;
+        float sharpnessMultiplier = max(1023 * sharpnessSquared * sharpnessSquared, 1e-10);
         float3 sum[6];
         float3 squaredSum[6];
         float gaussianSum[6];
         float sampleCount[6];
 
-        float radius = length(float2((float(OILIFY_SIZE) / 2), (float(OILIFY_SIZE) / 4)));
+        // Compare squared distances so the per-sample radius test needs no sqrt().
+        float2 radiusVector = float2((float(OILIFY_SIZE) / 2), (float(OILIFY_SIZE) / 4));
+        float radiusSquared = dot(radiusVector, radiusVector);
         
         float3 anistropyData = tex2D(sAnisotropy, texcoord).xyz;
         float2 t = anistropyData.xy;
@@ -497,16 +698,19 @@ namespace Oilify
                 
                 if(all(int2(i, j) == 0))
                 {
+                    // The center sample is identical for all six sectors, so
+                    // fetch it once instead of issuing six equivalent texture reads.
+                    float3 centerColor = tex2D(sBackBuffer, texcoord).rgb * sharpnessMultiplier;
+                    float3 centerSquared = centerColor * centerColor;
                     [unroll]
                     for(int k = 0; k < 6; k++)
                     {
-                        float3 color = tex2D(sBackBuffer, texcoord).rgb * sharpnessMultiplier;
-                        sum[k] += color;
-                        squaredSum[k] += color * color;
+                        sum[k] += centerColor;
+                        squaredSum[k] += centerSquared;
                         sampleCount[k]++;
                     }
                 }
-                else if(length(offset) <= radius)
+                else if(dot(offset, offset) <= radiusSquared)
                 {
                     float angle = atan2(offset.x, offset.y) + PI;
                     if(angle > 5.75958653158)
@@ -535,7 +739,13 @@ namespace Oilify
             float3 mean = sum[i] / sampleCount[i];
             float3 variance = (squaredSum[i] - ((sumSquared) / sampleCount[i]));
             variance /= sampleCount[0];
-            float3 weight = 1 / (1 + pow(sqrt(max(dot(variance, float3(0.299, 0.587, 0.114)), 1e-5)), 8));
+
+            // Original expression: 1 / (1 + pow(sqrt(x), 8)) == 1 / (1 + x^4)
+            // for x >= 0. Expanding the powers removes both pow() and sqrt().
+            float varianceLuma = max(dot(variance, float3(0.299, 0.587, 0.114)), 1e-5);
+            float varianceSquared = varianceLuma * varianceLuma;
+            float varianceFourth = varianceSquared * varianceSquared;
+            float weight = 1.0 / (1.0 + varianceFourth);
             weightedSum += mean * weight;
             weightSum += weight;
         }
@@ -1236,6 +1446,15 @@ namespace Oilify
         ui_tooltip = "Anisotropic Kuwahara Oilify with a simple preset layer with strong style presets, grouped brush flow, visible temporal motion, and an optional detailed painterly toolkit."
     ;>
     {
+        // Prepass: Posterization -> procedural canvas.
+        // It writes to the normal backbuffer so every subsequent original
+        // Oilify stage automatically consumes the transformed image.
+        pass
+        {
+            VertexShader = PostProcessVS;
+            PixelShader = PreOilifyPS;
+        }
+
         // Original anisotropy pass.
         pass
         {
