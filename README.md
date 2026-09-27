@@ -1,19 +1,48 @@
-Ganossa Motion Focus - Modernized Edition with Motion Fisheye
-=================
+Oilify - Painterly Strokes v19 (optimized)
+================
+Optimization goals:
+- Keep the supplied original Oilify/Kuwahara math intact.
+- Remove the extra full-screen Capture pass.
+- Replace the v9 5x5 x 2 stroke searches with one 3x3 search.
+- Sample Anisotropy once per brush pixel instead of once per candidate stroke.
+- Remove per-candidate sin/cos and use cheap hash/polynomial shape functions.
+- Use one coherent stroke-color sample per pixel.
+- Keep Paint Drag axial and optional.
+- Add larger-scale bristle grooves, paint-load variation, stroke scatter, controllable direction jitter, edge wear, dry-brush breakup and paint relief.
+- Give each stroke an independent temporal phase, speed, direction wobble, and breathing rate.
+- Use smoothed triangle waves for more organic continuous motion.
+- Protect strong silhouettes using derivative-based edge detection (no extra texture fetches).
+- Add subtle per-stroke pigment variation and one-sided paint pooling with math only.
+- Add shape-adaptive stroke sizing: broad calm regions use longer strokes while complex structure uses shorter, more controlled strokes.
+- Add stroke clumping: nearby strokes can share a gentle directional family and partially shared temporal motion.
+- Add contour flow: optional tendency for strokes to follow strong local silhouette flow without extra texture fetches.
+- Add shape-adaptive motion: calm regions drift farther while detailed edges remain steadier, without synchronizing strokes globally.
+- Keep the new controls math-only so these features do not add texture fetches.
+- Optimize stroke search with one seed hash per candidate and a cheap coarse cull.
+- Precompute per-pixel form/motion factors outside the 3x3 candidate loop.
+- Compute contour-following tangent once per pixel and reuse it for all candidates.
+- Skip the final paint color fetch entirely when the pixel is outside all stroke coverage.
 
- Ganossa Motion Focus port with Motion Fisheye support 
- Original concept: Ganossa (mediehawk@gmail.com) 
+The expensive original part is intentionally preserved so Sharpness / Scale /
+Tuning retain the behavior of the supplied Oilify.fx.
+
+Ganossa Motion Focus - Modern Edition
+=================
+ Original concept: Ganossa (mediehawk@gmail.com)  
  Original port credit: IDDQD 
  
-Modernization goals:
-- Keep the original motion-following idea.
-- Remove the resolution-dependent 5184 normalization.
-- Replace the legacy ~192x108 analysis loop with a fixed 32x18 grid.
-- Make motion detection usable with HDR / wide luminance ranges.
-- Add temporal persistence and focus smoothing controls.
-- Add independent Fisheye deadzone and frame-rate-independent persistence.
-- Use a centered zoom transform instead of the legacy edge-correction formula.
-- Avoid discard-based partial rendering.
+ Modern additions:
+ - Resolution-independent motion analysis (fixed 32x18 grid).
+ - Frame-time-aware temporal persistence.
+ - Independent motion fisheye.
+ - Independent motion chromatic aberration.
+ - Independent edge Gaussian blur.
+ - Separate deadzone + persistence for every motion-driven effect.
+ - Each optional effect has its own checkbox + collapsible UI category.
+ - Idle figure-eight head sway integrated into Motion Focus/Zoom framing.
+   
+ Head Sway V3: continuous speed reduction instead of hard idle stop.  
+ Fisheye V4: accumulated attack + persistence release, with a more sensitive.
  
  Target:
  ReShade 6.x / current ReShade FX
