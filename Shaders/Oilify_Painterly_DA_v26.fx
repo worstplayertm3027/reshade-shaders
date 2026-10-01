@@ -1,5 +1,5 @@
 /*
-    Oilify - Painterly Strokes v24 (optimized)
+    Oilify - Painterly Strokes v26 (Adaptive Depth)
 
     Optimization goals:
       - Keep the supplied original Oilify/Kuwahara math intact.
@@ -24,6 +24,8 @@
       - Precompute per-pixel form/motion factors outside the 3x3 candidate loop.
       - Compute contour-following tangent once per pixel and reuse it for all candidates.
       - Skip the final paint color fetch entirely when the pixel is outside all stroke coverage.
+      - Add a mutually exclusive depth-adaptive final mode with smooth camera-distance weighting.
+      - Capture the pre-Oilify source in the existing anisotropy pass via MRT, avoiding an extra copy pass.
 
     The expensive original part is intentionally preserved so Sharpness / Scale /
     Tuning retain the behavior of the supplied Oilify.fx.
@@ -69,6 +71,20 @@ static const float GAUSSIAN_OFFSETS[5] = {-3.2979345488, -1.40919905099, 0, 1.40
 namespace Oilify
 {
     texture BackBuffer : COLOR;
+
+    // Captures the pre-Oilify image during the existing anisotropy pass.
+    // This is the same image that the Kuwahara stage receives, so adaptive
+    // compositing does not need a separate source-copy pass.
+    texture OriginalInput < pooled = true; >
+    {
+        Width = BUFFER_WIDTH;
+        Height = BUFFER_HEIGHT;
+        Format = RGBA16f;
+    };
+
+    // ReShade's special DEPTH semantic provides the application's depth buffer.
+    texture2D DepthBufferTex : DEPTH;
+
     texture Anisotropy {Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA16f;};
     texture OilifyResult
     {
@@ -78,12 +94,41 @@ namespace Oilify
     };
 
     sampler sBackBuffer{Texture = BackBuffer;};
+    sampler sOriginalInput{Texture = OriginalInput; MagFilter = LINEAR; MinFilter = LINEAR; MipFilter = LINEAR;};
+    sampler sDepthBuffer{Texture = DepthBufferTex; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT;};
     sampler sAnisotropy{Texture = Anisotropy;};
     sampler sOilifyResult{Texture = OilifyResult;};
+
+    uniform bool HasDepth < source = "bufready_depth"; hidden = true; >;
 
     // ---------------------------------------------------------------------
     // Simple settings
     // ---------------------------------------------------------------------
+
+    // 0 = original full-image application, 1 = depth-adaptive application.
+    // The branch is resolved in the final pixel shader so depth is never sampled
+    // in the default full-image mode.
+    uniform int FilterMode<
+        ui_type = "combo";
+        ui_category = "Simple Settings";
+        ui_label = "Filter Mode";
+        ui_items = "Full Image\0Adaptive Depth\0";
+        ui_min = 0; ui_max = 1;
+        ui_tooltip = "Full Image applies the complete filter uniformly. Adaptive Depth uses the depth buffer to vary filter strength smoothly with camera distance.";
+    > = 0;
+
+    // This control is used only by Full Image mode. Adaptive Depth mode ignores
+    // it completely and uses the three controls in Adaptive Depth Settings.
+    // ReShade FX does not provide a dynamic per-uniform disabled/greyed state,
+    // so the slider remains visible but becomes a no-op in Adaptive Depth mode.
+    uniform float FilterStrength<
+        ui_category = "Simple Settings";
+        ui_type = "slider";
+        ui_label = "Filter Strength";
+        ui_tooltip = "Overall amount of the complete Oilify + painterly result in Full Image mode. This control is ignored in Adaptive Depth mode.";
+        ui_min = 0; ui_max = 1;
+        ui_step = 0.001;
+    > = 1.0;
 
     uniform int SimplePreset<
         ui_type = "combo";
@@ -155,6 +200,34 @@ namespace Oilify
         ui_min = 0; ui_max = 1;
         ui_step = 0.001;
     > = 0.42;
+
+    uniform float AdaptiveForegroundStrength<
+        ui_category = "Adaptive Depth Settings";
+        ui_category_closed = true;
+        ui_type = "slider";
+        ui_label = "Foreground Filter Strength";
+        ui_tooltip = "Filter strength for geometry close to the camera. Used only in Adaptive Depth mode.";
+        ui_min = 0; ui_max = 1;
+        ui_step = 0.001;
+    > = 0.35;
+
+    uniform float AdaptiveBackgroundStrength<
+        ui_category = "Adaptive Depth Settings";
+        ui_type = "slider";
+        ui_label = "Background Filter Strength";
+        ui_tooltip = "Filter strength for distant geometry. Used only in Adaptive Depth mode.";
+        ui_min = 0; ui_max = 1;
+        ui_step = 0.001;
+    > = 0.90;
+
+    uniform float AdaptiveDepthBoundary<
+        ui_category = "Adaptive Depth Settings";
+        ui_type = "slider";
+        ui_label = "Foreground / Background Boundary";
+        ui_tooltip = "Approximate camera distance in meters at the center of the transition. The transition is deliberately soft, spanning about 50 meters. Actual linearization follows ReShade's configured far plane.";
+        ui_min = 1; ui_max = 1000;
+        ui_step = 1;
+    > = 40;
 
     // ---------------------------------------------------------------------
     // Advanced painterly controls
@@ -602,9 +675,17 @@ namespace Oilify
         return max(canvasColor, 0.0);
     }
 
-    void PreOilifyPS(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float4 outputColor : SV_TARGET0)
+    void PreOilifyPS(
+        float4 vpos : SV_POSITION,
+        float2 texcoord : TEXCOORD,
+        out float4 outputColor : SV_TARGET0,
+        out float4 originalOutput : SV_TARGET1)
     {
-        float3 color = tex2D(sBackBuffer, texcoord).rgb;
+        float3 original = tex2D(sBackBuffer, texcoord).rgb;
+        float3 color = original;
+
+        // The pre-Oilify reference is captured in the existing anisotropy pass.
+        originalOutput = float4(original, 1.0);
 
         // Required order: posterization first, canvas treatment second.
         color = ApplyPosterization(color);
@@ -617,9 +698,16 @@ namespace Oilify
     // ORIGINAL ANISOTROPY CODE
     // ---------------------------------------------------------------------
 
-    void AnisotropyPS(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float4 anisotropyData : SV_TARGET0)
+    void AnisotropyPS(
+        float4 vpos : SV_POSITION,
+        float2 texcoord : TEXCOORD,
+        out float4 anisotropyData : SV_TARGET0,
+        out float4 originalOutput : SV_TARGET1)
     {
-        float3 center = tex2D(sBackBuffer, texcoord).rgb * 255;
+        float3 inputColor = tex2D(sBackBuffer, texcoord).rgb;
+        originalOutput = float4(inputColor, 1.0);
+
+        float3 center = inputColor * 255;
         float3 dx = center * GAUSSIAN_WEIGHTS[2];
         float3 dy = dx;
         
@@ -1168,6 +1256,146 @@ namespace Oilify
         return saturate(color * value * pigmentTint);
     }
 
+    // ---------------------------------------------------------------------
+    // Adaptive depth compositing
+    // ---------------------------------------------------------------------
+
+    #ifndef RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN
+        #define RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN 0
+    #endif
+    #ifndef RESHADE_DEPTH_INPUT_IS_REVERSED
+        #define RESHADE_DEPTH_INPUT_IS_REVERSED 1
+    #endif
+    #ifndef RESHADE_DEPTH_INPUT_IS_MIRRORED
+        #define RESHADE_DEPTH_INPUT_IS_MIRRORED 0
+    #endif
+    #ifndef RESHADE_DEPTH_INPUT_IS_LOGARITHMIC
+        #define RESHADE_DEPTH_INPUT_IS_LOGARITHMIC 0
+    #endif
+    #ifndef RESHADE_DEPTH_MULTIPLIER
+        #define RESHADE_DEPTH_MULTIPLIER 1
+    #endif
+    #ifndef RESHADE_DEPTH_LINEARIZATION_FAR_PLANE
+        #define RESHADE_DEPTH_LINEARIZATION_FAR_PLANE 1000.0
+    #endif
+    #ifndef RESHADE_DEPTH_INPUT_Y_SCALE
+        #define RESHADE_DEPTH_INPUT_Y_SCALE 1
+    #endif
+    #ifndef RESHADE_DEPTH_INPUT_X_SCALE
+        #define RESHADE_DEPTH_INPUT_X_SCALE 1
+    #endif
+    #ifndef RESHADE_DEPTH_INPUT_Y_OFFSET
+        #define RESHADE_DEPTH_INPUT_Y_OFFSET 0
+    #endif
+    #ifndef RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET
+        #define RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET 0
+    #endif
+    #ifndef RESHADE_DEPTH_INPUT_X_OFFSET
+        #define RESHADE_DEPTH_INPUT_X_OFFSET 0
+    #endif
+    #ifndef RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET
+        #define RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET 0
+    #endif
+
+    // ReShade's linearization produces a normalized camera-space depth in [0,1].
+    // Multiplying by the configured far plane turns it into the approximate scene
+    // distance used by the meter-based boundary slider.
+    float GetAdaptiveDepthMeters(float2 texcoord)
+    {
+    #if RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN
+        texcoord.y = 1.0 - texcoord.y;
+    #endif
+    #if RESHADE_DEPTH_INPUT_IS_MIRRORED
+        texcoord.x = 1.0 - texcoord.x;
+    #endif
+
+        texcoord.x /= RESHADE_DEPTH_INPUT_X_SCALE;
+        texcoord.y /= RESHADE_DEPTH_INPUT_Y_SCALE;
+
+    #if RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET
+        texcoord.x -= RESHADE_DEPTH_INPUT_X_PIXEL_OFFSET * BUFFER_RCP_WIDTH;
+    #else
+        texcoord.x -= RESHADE_DEPTH_INPUT_X_OFFSET / 2.000000001;
+    #endif
+
+    #if RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET
+        texcoord.y += RESHADE_DEPTH_INPUT_Y_PIXEL_OFFSET * BUFFER_RCP_HEIGHT;
+    #else
+        texcoord.y += RESHADE_DEPTH_INPUT_Y_OFFSET / 2.000000001;
+    #endif
+
+        float depth = tex2Dlod(sDepthBuffer, float4(texcoord, 0, 0)).x * RESHADE_DEPTH_MULTIPLIER;
+
+    #if RESHADE_DEPTH_INPUT_IS_LOGARITHMIC
+        const float C = 0.01;
+        depth = (exp(depth * log(C + 1.0)) - 1.0) / C;
+    #endif
+
+    #if RESHADE_DEPTH_INPUT_IS_REVERSED
+        depth = 1.0 - depth;
+    #endif
+
+        const float N = 1.0;
+        const float farPlane = max(float(RESHADE_DEPTH_LINEARIZATION_FAR_PLANE), N + 1e-3);
+        depth /= farPlane - depth * (farPlane - N);
+        depth = saturate(depth);
+        return depth * farPlane;
+    }
+
+    // Separate mode paths: in full-image mode no depth read occurs at all.
+    float3 CompositeFullImage(float3 filtered, float2 texcoord)
+    {
+        float strength = saturate(FilterStrength);
+        if (strength >= 0.999)
+            return filtered;
+
+        float3 original = tex2D(sOriginalInput, texcoord).rgb;
+        return lerp(original, filtered, strength);
+    }
+
+    float3 CompositeAdaptiveDepth(float3 filtered, float2 texcoord)
+    {
+        float foreground = saturate(AdaptiveForegroundStrength);
+        float background = saturate(AdaptiveBackgroundStrength);
+
+        // Uniform endpoints are cheap fast paths and need no source/depth sample.
+        if (foreground >= 0.999 && background >= 0.999)
+            return filtered;
+
+        // If the game does not expose a usable depth buffer, keep the full filtered
+        // result rather than inventing a distance split.
+        if (!HasDepth)
+            return filtered;
+
+        // Equal strengths make the adaptive mode spatially uniform, so depth is unnecessary.
+        if (abs(background - foreground) <= 0.001)
+        {
+            float3 uniformOriginal = tex2D(sOriginalInput, texcoord).rgb;
+            return lerp(uniformOriginal, filtered, foreground);
+        }
+
+        // This texture contains the image immediately before Kuwahara, not a
+        // potentially invalid backbuffer copy, so zero-strength areas retain
+        // their real source color.
+        float3 original = tex2D(sOriginalInput, texcoord).rgb;
+
+        if (foreground <= 0.001 && background <= 0.001)
+            return original;
+
+        float depthMeters = GetAdaptiveDepthMeters(texcoord);
+
+        // A fixed 50 m-wide transition (25 m on either side of the boundary)
+        // avoids an artificial hard wall between foreground and background.
+        const float transitionHalfWidthMeters = 25.0;
+        float transition = smoothstep(
+            max(0.0, AdaptiveDepthBoundary - transitionHalfWidthMeters),
+            AdaptiveDepthBoundary + transitionHalfWidthMeters,
+            depthMeters);
+
+        float strength = lerp(foreground, background, transition);
+        return lerp(original, filtered, strength);
+    }
+
     void BrushPS(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float4 outputColor : SV_TARGET0)
     {
         float3 base = tex2D(sOilifyResult, texcoord).rgb;
@@ -1291,13 +1519,12 @@ namespace Oilify
             }
         }
 
-        // Uniform branch: if the brush is disabled, avoid all geometry work.
-        if (brushStrength <= 0.001)
-        {
-            outputColor = float4(base, 1.0);
-            return;
-        }
+        // Keep the base Oilify result when the painterly layer is disabled, but
+        // continue to the mode-specific final blend so Filter Strength still works.
+        float3 result = base;
 
+        if (brushStrength > 0.001)
+        {
         float2 pixel = texcoord * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
         float timeSeconds = TimerMs * 0.001 * max(instabilitySpeed, 0.0);
         float temporalAmount = saturate(temporalInstability);
@@ -1399,47 +1626,56 @@ namespace Oilify
         }
 
         // Sparse brush layouts have many pixels outside a stroke. Avoid the
-        // additional color fetch and paint math for those pixels.
-        if (strokeMask <= 0.001)
+        // additional color fetch and paint math for those pixels, while still
+        // allowing the mode-specific filter-strength composite below to run.
+        if (strokeMask > 0.001)
         {
-            outputColor = float4(base, 1.0);
-            return;
+            // One coherent axial color sample. Paint Drag shifts this source along
+            // the same axis instead of sampling both sides of the image edge.
+            float2 axisPoint = strokeCenter
+                             + strokeTangent * strokeLocalX
+                             + strokeNormal * strokeCurve;
+            axisPoint += strokeTangent * (paintDrag * strokeLength * 0.10);
+
+            float2 axisUV = saturate(axisPoint * float2(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT));
+            float3 axisColor = tex2D(sOilifyResult, axisUV).rgb;
+            float3 strokeColor = lerp(base, axisColor, saturate(strokeCoherence));
+
+            float paintCoverage;
+            strokeColor = ApplyBroadPaintTexture(
+                strokeColor,
+                strokeLocalX,
+                strokeLocalY,
+                foundWidth,
+                foundLength,
+                strokeSeed,
+                strokeTexture,
+                strokeBristle,
+                paintLoad,
+                bristleBreakup,
+                paintRelief,
+                pigmentVariation,
+                paintPooling,
+                paintCoverage);
+
+            float blend = saturate(strokeMask * brushStrength * paintCoverage);
+            float edgeGuard = smoothstep(0.025, 0.12, strokeMask);
+            blend *= edgeGuard;
+
+            result = lerp(base, strokeColor, blend);
+        }
         }
 
-        // One coherent axial color sample. Paint Drag shifts this source along
-        // the same axis instead of sampling both sides of the image edge.
-        float2 axisPoint = strokeCenter
-                         + strokeTangent * strokeLocalX
-                         + strokeNormal * strokeCurve;
-        axisPoint += strokeTangent * (paintDrag * strokeLength * 0.10);
+        // Mode selection is a single coherent uniform branch. The two compositing
+        // paths are kept separate so Adaptive Depth never executes in Full Image
+        // mode, and Full Image never samples the depth buffer.
+        float3 finalColor;
+        if (FilterMode == 0)
+            finalColor = CompositeFullImage(result, texcoord);
+        else
+            finalColor = CompositeAdaptiveDepth(result, texcoord);
 
-        float2 axisUV = saturate(axisPoint * float2(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT));
-        float3 axisColor = tex2D(sOilifyResult, axisUV).rgb;
-        float3 strokeColor = lerp(base, axisColor, saturate(strokeCoherence));
-
-        float paintCoverage;
-        strokeColor = ApplyBroadPaintTexture(
-            strokeColor,
-            strokeLocalX,
-            strokeLocalY,
-            foundWidth,
-            foundLength,
-            strokeSeed,
-            strokeTexture,
-            strokeBristle,
-            paintLoad,
-            bristleBreakup,
-            paintRelief,
-            pigmentVariation,
-            paintPooling,
-            paintCoverage);
-
-        float blend = saturate(strokeMask * brushStrength * paintCoverage);
-        float edgeGuard = smoothstep(0.025, 0.12, strokeMask);
-        blend *= edgeGuard;
-
-        float3 result = lerp(base, strokeColor, blend);
-        outputColor = float4(result, 1.0);
+        outputColor = float4(finalColor, 1.0);
     }
 
     technique Oilify<
@@ -1447,8 +1683,8 @@ namespace Oilify
     ;>
     {
         // Prepass: Posterization -> procedural canvas.
-        // It writes to the normal backbuffer so every subsequent original
-        // Oilify stage automatically consumes the transformed image.
+        // RT0 is the normal backbuffer. The pre-Oilify reference used for
+        // strength blending is captured later during the existing anisotropy pass.
         pass
         {
             VertexShader = PostProcessVS;
@@ -1461,6 +1697,7 @@ namespace Oilify
             VertexShader = PostProcessVS;
             PixelShader = AnisotropyPS;
             RenderTarget0 = Anisotropy;
+            RenderTarget1 = OriginalInput;
         }
 
         // Intermediate Kuwahara iterations write to the normal backbuffer.
